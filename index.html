@@ -157,6 +157,7 @@
   <label style="display:flex;align-items:center;gap:6px;color:var(--muted);font-size:12px;cursor:pointer;user-select:none;">
     <input type="checkbox" id="expertToggle" style="cursor:pointer;"> Expert mode
   </label>
+  <button id="inspectorBtn" class="ghost" title="Inspect live program state via VM Service Protocol">Inspect</button>
   <button id="infoBtn" class="ghost" title="About">i</button>
   <span class="status" id="status">Loading…</span>
 </div>
@@ -206,7 +207,33 @@
     </div>
     <pre id="output">Loading…</pre>
   </div>
+  <div class="pane" id="inspectorPane" style="display:none;">
+    <div class="pane-header">
+      <span>Inspector <span style="color:var(--muted);text-transform:none;letter-spacing:0;font-weight:normal;">(VM Service Protocol)</span></span>
+      <button id="inspectorRefresh" class="ghost" style="padding:2px 8px;font-size:11px;">refresh</button>
+    </div>
+    <div id="inspectorBody" style="flex:1;min-height:0;overflow:auto;padding:8px 10px;font-family:'JetBrains Mono',ui-monospace,monospace;font-size:12px;line-height:1.5;color:var(--text);">
+      <span style="color:var(--muted);">Run a program, then click <em>refresh</em> or invoke a function.</span>
+    </div>
+  </div>
 </div>
+<style>
+  .layout.with-inspector { grid-template-columns: 1fr 1fr 1fr; }
+  .insp-row { display:flex; padding: 1px 0; }
+  .insp-toggle { width: 14px; color: var(--dart-blue-hover); cursor: pointer; user-select: none; flex-shrink: 0; }
+  .insp-toggle.empty { color: transparent; cursor: default; }
+  .insp-name  { color: var(--dart-blue-hover); }
+  .insp-type  { color: var(--muted); }
+  .insp-eq    { color: var(--muted); margin: 0 5px; }
+  .insp-prim  { color: #d2a8ff; }
+  .insp-str   { color: #a5d6ff; }
+  .insp-null  { color: var(--muted); font-style: italic; }
+  .insp-kids  { padding-left: 16px; border-left: 1px dashed var(--border); margin-left: 6px; }
+  .insp-header { color: var(--muted); font-size: 10.5px; text-transform: uppercase;
+                  letter-spacing: 0.5px; margin: 10px 0 4px; padding-bottom: 2px;
+                  border-bottom: 1px solid var(--border); }
+  .insp-header:first-child { margin-top: 0; }
+</style>
 
 <script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.50.0/min/vs/loader.js"></script>
 <script>
@@ -778,6 +805,29 @@ runBtn.disabled = false;  // reloadBtn stays disabled until first successful Run
 const runAsync = VM.cwrap('dart_il_run', 'number', ['number', 'number'], { async: true });
 const reloadAsync = VM.cwrap('dart_il_hot_reload', 'number', ['number', 'number', 'number']);
 const invokeAsync = VM.cwrap('dart_il_invoke', 'number', ['number', 'number']);
+const vmserviceRaw = VM.cwrap('dart_il_vmservice', 'number', ['number', 'number']);
+
+// ---- VM Service Protocol bridge ------------------------------------------
+// Forwards JSON-RPC method calls to the patched Service::InvokeRpcSync entry
+// point in the VM. Synchronous: no service isolate, no ports, no WebSocket.
+function vmService(method, params) {
+  const mLen = VM.lengthBytesUTF8(method) + 1;
+  const mPtr = VM._malloc(mLen); VM.stringToUTF8(method, mPtr, mLen);
+  let pPtr = 0;
+  if (params) {
+    const csv = Object.entries(params)
+      .filter(([_, v]) => v !== undefined && v !== null)
+      .map(([k, v]) => `${k}=${v}`).join('&');
+    if (csv) {
+      const pLen = VM.lengthBytesUTF8(csv) + 1;
+      pPtr = VM._malloc(pLen); VM.stringToUTF8(csv, pPtr, pLen);
+    }
+  }
+  const json = VM.UTF8ToString(vmserviceRaw(mPtr, pPtr));
+  VM._free(mPtr); if (pPtr) VM._free(pPtr);
+  try { return JSON.parse(json); }
+  catch (e) { return { error: { message: 'parse failed', raw: json } }; }
+}
 const extractSync = VM.cwrap('dart_il_extract', 'number', ['number', 'number', 'number', 'number', 'number', 'number']);
 
 async function compile(source) {
@@ -1186,6 +1236,189 @@ $('infoClose').addEventListener('click', () => $('infoDialog').style.display = '
 $('infoDialog').addEventListener('click', e => { if (e.target === $('infoDialog')) $('infoDialog').style.display = 'none'; });
 runBtn.addEventListener('click', doRun);
 reloadBtn.addEventListener('click', doReload);
+
+// ---- Inspector pane (VM Service Protocol) -------------------------------
+let inspectorOpen = false;
+let cachedIsolateId = null;
+function getIsolateId() {
+  if (cachedIsolateId) return cachedIsolateId;
+  const r = vmService('getIsolate');
+  cachedIsolateId = r?.result?.id ?? null;
+  return cachedIsolateId;
+}
+
+const escHtml = s => String(s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+// Render a single Instance object as a row. If it's primitive show the value
+// inline; if it's a container/object show a toggle that expands to fetch
+// children lazily on first expansion.
+function renderInstance(instance, depth = 0) {
+  const wrap = document.createElement('span');
+  if (!instance || instance.kind === undefined) {
+    wrap.innerHTML = '<span class="insp-null">(no value)</span>';
+    return wrap;
+  }
+  const k = instance.kind;
+  if (k === 'Null') {
+    wrap.innerHTML = '<span class="insp-null">null</span>';
+  } else if (k === 'Bool' || k === 'Int' || k === 'Double') {
+    wrap.innerHTML = '<span class="insp-prim">' + escHtml(instance.valueAsString) + '</span>';
+  } else if (k === 'String') {
+    const s = instance.valueAsString ?? '';
+    wrap.innerHTML = '<span class="insp-str">"' + escHtml(s) + '"</span>';
+    if (instance.valueAsStringIsTruncated) wrap.innerHTML += '<span class="insp-null"> (truncated)</span>';
+  } else if (k === 'List' || k === 'Map' || k === 'Set') {
+    const len = instance.length ?? 0;
+    const cls = instance.class?.name ?? k;
+    const head = document.createElement('span');
+    head.innerHTML = '<span class="insp-type">' + escHtml(cls) + '[' + len + ']</span>';
+    wrap.appendChild(head);
+    if (depth < 2 && len > 0 && instance.id) {
+      const expander = document.createElement('span');
+      expander.className = 'insp-toggle';
+      expander.textContent = ' ▸';
+      expander.style.cursor = 'pointer';
+      let expanded = false;
+      const kidsDiv = document.createElement('div');
+      kidsDiv.className = 'insp-kids';
+      kidsDiv.style.display = 'none';
+      expander.addEventListener('click', () => {
+        expanded = !expanded;
+        expander.textContent = expanded ? ' ▾' : ' ▸';
+        kidsDiv.style.display = expanded ? '' : 'none';
+        if (expanded && kidsDiv.childElementCount === 0) {
+          const r = vmService('getObject', { isolateId: getIsolateId(), objectId: instance.id });
+          const items = r?.result?.elements ?? r?.result?.associations ?? [];
+          items.slice(0, 100).forEach((el, i) => {
+            const row = document.createElement('div');
+            row.className = 'insp-row';
+            const idxBox = document.createElement('span');
+            idxBox.className = 'insp-name';
+            idxBox.textContent = `[${i}]`;
+            const eq = document.createElement('span'); eq.className = 'insp-eq'; eq.textContent = '=';
+            row.appendChild(idxBox); row.appendChild(eq);
+            // For Lists: el IS the value. For Maps: el is {key, value}.
+            const value = el.value !== undefined ? el.value : el;
+            row.appendChild(renderInstance(value, depth + 1));
+            kidsDiv.appendChild(row);
+          });
+          if (items.length > 100) {
+            const more = document.createElement('div');
+            more.className = 'insp-null';
+            more.textContent = `... ${items.length - 100} more`;
+            kidsDiv.appendChild(more);
+          }
+        }
+      });
+      wrap.appendChild(expander);
+      wrap.appendChild(kidsDiv);
+    }
+  } else if (k === 'PlainInstance') {
+    const cls = instance.class?.name ?? 'object';
+    const head = document.createElement('span');
+    head.innerHTML = '<span class="insp-type">' + escHtml(cls) + ' {…}</span>';
+    wrap.appendChild(head);
+    if (depth < 2 && instance.id) {
+      const expander = document.createElement('span');
+      expander.className = 'insp-toggle';
+      expander.textContent = ' ▸';
+      expander.style.cursor = 'pointer';
+      let expanded = false;
+      const kidsDiv = document.createElement('div');
+      kidsDiv.className = 'insp-kids';
+      kidsDiv.style.display = 'none';
+      expander.addEventListener('click', () => {
+        expanded = !expanded;
+        expander.textContent = expanded ? ' ▾' : ' ▸';
+        kidsDiv.style.display = expanded ? '' : 'none';
+        if (expanded && kidsDiv.childElementCount === 0) {
+          const r = vmService('getObject', { isolateId: getIsolateId(), objectId: instance.id });
+          const fields = r?.result?.fields ?? [];
+          fields.forEach(f => {
+            const row = document.createElement('div');
+            row.className = 'insp-row';
+            const n = document.createElement('span'); n.className = 'insp-name'; n.textContent = f.decl?.name ?? f.name ?? '?';
+            const eq = document.createElement('span'); eq.className = 'insp-eq'; eq.textContent = '=';
+            row.appendChild(n); row.appendChild(eq);
+            row.appendChild(renderInstance(f.value, depth + 1));
+            kidsDiv.appendChild(row);
+          });
+        }
+      });
+      wrap.appendChild(expander);
+      wrap.appendChild(kidsDiv);
+    }
+  } else if (k === 'Closure') {
+    wrap.innerHTML = '<span class="insp-type">Closure</span> <span class="insp-null">' +
+      escHtml(instance.closureFunction?.name ?? '') + '</span>';
+  } else {
+    wrap.innerHTML = '<span class="insp-type">' + escHtml(k) + '</span>';
+  }
+  return wrap;
+}
+
+function refreshInspector() {
+  const body = $('inspectorBody');
+  body.innerHTML = '';
+  if (!hasRun) {
+    body.innerHTML = '<span style="color:var(--muted);">Run a program first to inspect its state.</span>';
+    return;
+  }
+  cachedIsolateId = null;  // re-resolve in case of reload
+  const isoId = getIsolateId();
+  if (!isoId) {
+    body.innerHTML = '<span class="err">no isolate available</span>';
+    return;
+  }
+  const iso = vmService('getIsolate');
+  const libs = iso?.result?.libraries ?? [];
+  const userLibs = libs.filter(l => !/^dart:/.test(l.uri) && !/^package:(?!user)/.test(l.uri));
+  if (userLibs.length === 0) {
+    body.innerHTML = '<span class="err">no user libraries reported</span>';
+    return;
+  }
+  userLibs.forEach(libRef => {
+    const lib = vmService('getObject', { isolateId: isoId, objectId: libRef.id })?.result;
+    if (!lib) return;
+    const hdr = document.createElement('div');
+    hdr.className = 'insp-header';
+    hdr.textContent = lib.uri;
+    body.appendChild(hdr);
+    (lib.variables ?? []).forEach(fieldRef => {
+      const f = vmService('getObject', { isolateId: isoId, objectId: fieldRef.id })?.result;
+      if (!f) return;
+      const row = document.createElement('div');
+      row.className = 'insp-row';
+      const n = document.createElement('span'); n.className = 'insp-name';
+      n.textContent = (f.const ? 'const ' : f.static ? '' : '') + (f.name ?? fieldRef.name);
+      const eq = document.createElement('span'); eq.className = 'insp-eq'; eq.textContent = '=';
+      row.appendChild(n); row.appendChild(eq);
+      row.appendChild(renderInstance(f.staticValue, 0));
+      body.appendChild(row);
+    });
+  });
+}
+
+function setInspectorOpen(open) {
+  inspectorOpen = open;
+  $('inspectorPane').style.display = open ? '' : 'none';
+  document.querySelector('.layout').classList.toggle('with-inspector', open);
+  $('inspectorBtn').style.background = open ? 'var(--dart-blue)' : '';
+  $('inspectorBtn').style.color = open ? 'white' : '';
+  if (open) refreshInspector();
+}
+$('inspectorBtn').addEventListener('click', () => setInspectorOpen(!inspectorOpen));
+$('inspectorRefresh').addEventListener('click', refreshInspector);
+
+// Auto-refresh when the program state changes.
+const origDoRun = doRun;
+doRun = async function() { await origDoRun.apply(this, arguments); if (inspectorOpen) refreshInspector(); };
+const origDoReload = doReload;
+doReload = async function() { await origDoReload.apply(this, arguments); if (inspectorOpen) refreshInspector(); };
+const origDoInvoke = doInvoke;
+doInvoke = async function() { await origDoInvoke.apply(this, arguments); if (inspectorOpen) refreshInspector(); };
+invokeFn = (name) => doInvoke(name);  // re-bind since doInvoke was replaced
 </script>
 
 </body>
