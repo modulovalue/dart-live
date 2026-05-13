@@ -147,6 +147,8 @@
     <option value="iterative">★ Iterative π (Hot Reload + Invoke)</option>
     <option value="life">★ Conway's Life (Hot Reload + Invoke)</option>
     <option value="particles">★ Bouncing particles (Hot Reload + Invoke)</option>
+    <option value="jsinterop">★ JavaScript interop (jsEval)</option>
+    <option value="canvas">★ Canvas drawing (jsEval)</option>
     <option value="counter">Counter</option>
     <option value="async">Async / Future.delayed</option>
     <option value="fib">Fibonacci</option>
@@ -158,6 +160,7 @@
     <input type="checkbox" id="expertToggle" style="cursor:pointer;"> Expert mode
   </label>
   <button id="inspectorBtn" class="ghost" title="Inspect live program state via VM Service Protocol">Inspect</button>
+  <button id="sketchBtn" class="ghost" title="Toggle Sketch pane for canvas drawing experiments">Sketch</button>
   <button id="infoBtn" class="ghost" title="About">i</button>
   <span class="status" id="status">Loading…</span>
 </div>
@@ -216,9 +219,22 @@
       <span style="color:var(--muted);">Run a program, then click <em>refresh</em> or invoke a function.</span>
     </div>
   </div>
+  <div class="pane" id="sketchPane" style="display:none;">
+    <div class="pane-header">
+      <span>Sketch <span style="color:var(--muted);text-transform:none;letter-spacing:0;font-weight:normal;">(canvas via jsEval)</span></span>
+      <button id="sketchClear" class="ghost" style="padding:2px 8px;font-size:11px;">clear</button>
+    </div>
+    <div id="sketchHost" style="flex:1;min-height:0;display:flex;align-items:center;justify-content:center;background:#0d1117;overflow:hidden;">
+      <canvas id="sketch" width="500" height="500"
+              style="max-width:100%;max-height:100%;background:white;
+                     box-shadow:0 0 0 1px var(--border);border-radius:2px;"></canvas>
+    </div>
+  </div>
 </div>
 <style>
   .layout.with-inspector { grid-template-columns: 1fr 1fr 1fr; }
+  .layout.with-sketch    { grid-template-columns: 1fr 1fr 1fr; }
+  .layout.with-inspector.with-sketch { grid-template-columns: 1fr 1fr 1fr 1fr; }
   .insp-row { display:flex; padding: 1px 0; }
   .insp-toggle { width: 14px; color: var(--dart-blue-hover); cursor: pointer; user-select: none; flex-shrink: 0; }
   .insp-toggle.empty { color: transparent; cursor: default; }
@@ -248,6 +264,383 @@ const runBtn = $('runBtn'), reloadBtn = $('reloadBtn');
 const SAMPLES = {
   hello: `void main() {
   print('Hello, World!');
+}
+`,
+  // Direct access to the browser's JavaScript runtime from Dart, via a single
+  // native (EmbedderJSEval) bound by the embedder's NativeResolver. The
+  // sample shows passing Dart values to JS as a JSON-encoded args array
+  // (visible inside the JS snippet as \`args\` / \`a\`), and getting values
+  // back. Result is the JS expression's value, stringified.
+  jsinterop: `// Direct access to the host's JavaScript runtime from Dart.
+// Run once to register the bindings, then ▶ Invoke each example via the
+// CodeLens buttons above. Most of these poke the actual browser (alert,
+// prompt, document, localStorage) so you'll see real, obvious side effects.
+
+import 'dart:convert';
+
+@pragma("vm:external-name", "EmbedderJSEval")
+external String _jsEvalRaw(String code, String argsJson);
+
+/// Evaluate JS \`code\`. Pass Dart values in [args]; they're available inside
+/// the snippet as the array \`args\` (or its short alias \`a\`). The result
+/// is the stringified JS value; a leading "!" means JS threw.
+String jsEval(String code, [List<Object?> args = const []]) =>
+    _jsEvalRaw(code, jsonEncode(args));
+
+// ============================================================
+// === 1. Visual proof that JS interop is REAL: native dialogs
+// ============================================================
+
+void showAlert() {
+  // Real browser alert() dialog. Blocks the page until you click OK.
+  jsEval('alert(a[0])', ['Hello from a Dart VM running in WebAssembly!']);
+}
+
+void askConfirm() {
+  // confirm() returns true/false; we get it back as a stringified bool.
+  final answer = jsEval('confirm(a[0])', ['Are you having fun?']);
+  print('user said: \$answer');
+}
+
+void askName() {
+  final name = jsEval('prompt(a[0], a[1])', ['Your name?', 'stranger']);
+  if (name.isEmpty) {
+    print('cancelled');
+  } else {
+    print('hello, \$name!');
+  }
+}
+
+// ============================================================
+// === 2. Manipulate the DOM
+// ============================================================
+
+void changePageTitle() {
+  jsEval('document.title = "DartVM says: " + a[0]', ['hi from Dart!']);
+  print('look at the browser tab title');
+}
+
+void floatingBanner() {
+  // Inject a sticky banner in the top-right corner of the actual page.
+  // Click invoke again to add more. Click clearBanners() to remove.
+  jsEval(r'''
+    const div = document.createElement('div');
+    div.className = 'dart-injected';
+    div.textContent = a[0];
+    div.style.cssText = [
+      'position:fixed', 'top:' + (10 + 38 * document.querySelectorAll('.dart-injected').length) + 'px',
+      'right:10px', 'z-index:99999',
+      'background:#0175C2', 'color:white',
+      'padding:8px 14px', 'border-radius:6px',
+      'font:13px/1.4 "Google Sans",system-ui,sans-serif',
+      'box-shadow:0 2px 10px rgba(0,0,0,0.3)',
+      'animation:dartin 200ms ease-out'
+    ].join(';');
+    if (!document.getElementById('dart-keyframes')) {
+      const s = document.createElement('style');
+      s.id = 'dart-keyframes';
+      s.textContent = '@keyframes dartin{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}';
+      document.head.appendChild(s);
+    }
+    document.body.appendChild(div);
+  ''', ['Hello from Dart — banner #' '\${DateTime.now().millisecondsSinceEpoch ~/ 1000}']);
+  print('banner added (look top-right)');
+}
+
+void clearBanners() {
+  final n = jsEval(r'''
+    const els = document.querySelectorAll('.dart-injected');
+    els.forEach(e => e.remove());
+    els.length
+  ''');
+  print('removed \$n banners');
+}
+
+void changeBackgroundColor() {
+  // Random tint of the editor pane.
+  final hue = DateTime.now().millisecondsSinceEpoch % 360;
+  jsEval(
+    'document.body.style.background = "hsl(" + a[0] + " 30% 12%)"',
+    [hue],
+  );
+  print('body bg set to hsl(\$hue, 30%, 12%)');
+}
+
+// ============================================================
+// === 3. Read browser APIs
+// ============================================================
+
+void userAgent() {
+  print('userAgent: \${jsEval('navigator.userAgent')}');
+}
+
+void windowSize() {
+  print('window: \${jsEval('window.innerWidth + "x" + window.innerHeight')}');
+}
+
+void browserLanguage() {
+  // navigator.languages is an Array — comes back as JSON.
+  print('languages: \${jsEval('navigator.languages')}');
+}
+
+// ============================================================
+// === 4. Pass Dart values to JS
+// ============================================================
+
+void mathOnJsSide() {
+  final sum = jsEval('a[0] + a[1] + a[2]', [10, 20, 30]);
+  final hyp = jsEval('Math.hypot(a[0], a[1])', [3, 4]);
+  print('JS sum 10+20+30 = \$sum');
+  print('JS Math.hypot(3,4) = \$hyp');
+}
+
+void formatNumberWithIntl() {
+  // Use the real Intl API to format a Dart number.
+  final formatted = jsEval(
+    'new Intl.NumberFormat(a[1], { style:"currency", currency:a[2] }).format(a[0])',
+    [1234567.89, 'de-DE', 'EUR'],
+  );
+  print(formatted);
+}
+
+void isoTimestamp() {
+  final iso = jsEval(
+    'new Date(a[0]).toISOString()',
+    [DateTime.now().millisecondsSinceEpoch],
+  );
+  print('ISO from JS: \$iso');
+}
+
+// ============================================================
+// === 5. Round-trip values through real browser storage
+// ============================================================
+
+void writeToLocalStorage() {
+  jsEval(
+    'localStorage.setItem(a[0], JSON.stringify(a[1]))',
+    ['dartvm:demo', {'msg': 'hi', 'when': DateTime.now().toIso8601String()}],
+  );
+  final back = jsEval('localStorage.getItem(a[0])', ['dartvm:demo']);
+  print('round-tripped: \$back');
+}
+
+// ============================================================
+// === 6. Run a JS function over a Dart-supplied list
+// ============================================================
+
+void sortInJsCollation() {
+  // Sort a Dart-built list using JS's locale-aware comparator.
+  final words = ['Zürich', 'apple', 'Äpfel', 'banana', 'Österreich'];
+  final out = jsEval(
+    'a[0].slice().sort(new Intl.Collator("de-DE", { sensitivity:"base" }).compare)',
+    [words],
+  );
+  print('sorted: \$out');
+}
+
+void main() {
+  print('JS interop ready. Try ▶ Invoke showAlert() first.');
+}
+`,
+  // Canvas drawing into the Sketch pane via jsEval. Each example is a single
+  // big eval that bundles all the canvas operations for that drawing — one
+  // C++↔JS round-trip per Invoke click, so the actual draws happen at native
+  // speed. The pane on the right is a plain <canvas id="sketch"> element;
+  // anything you can do with the 2D context in JS works here.
+  canvas: `import 'dart:convert';
+
+@pragma("vm:external-name", "EmbedderJSEval")
+external String _jsEvalRaw(String code, String argsJson);
+
+String jsEval(String code, [List<Object?> args = const []]) =>
+    _jsEvalRaw(code, jsonEncode(args));
+
+// Each invoke is a self-contained "scene" drawn into the canvas in a single
+// eval. The Sketch pane on the right shows the result.
+
+void clear() {
+  jsEval(r'''
+    const c = document.getElementById('sketch');
+    const ctx = c.getContext('2d');
+    ctx.clearRect(0, 0, c.width, c.height);
+    ctx.fillStyle = 'white';
+    ctx.fillRect(0, 0, c.width, c.height);
+  ''');
+  print('cleared');
+}
+
+void colorWheel() {
+  jsEval(r'''
+    const c = document.getElementById('sketch'), W = c.width, H = c.height;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#0d1117'; ctx.fillRect(0, 0, W, H);
+    const cx = W/2, cy = H/2, R = Math.min(W, H) * 0.42;
+    for (let i = 0; i < 360; i++) {
+      const r = i * Math.PI / 180;
+      ctx.beginPath();
+      ctx.moveTo(cx, cy);
+      ctx.arc(cx, cy, R, r - 0.01, r + 0.012);
+      ctx.closePath();
+      ctx.fillStyle = 'hsl(' + i + ', 75%, 55%)';
+      ctx.fill();
+    }
+    ctx.fillStyle = '#0d1117';
+    ctx.beginPath(); ctx.arc(cx, cy, R*0.4, 0, Math.PI*2); ctx.fill();
+  ''');
+  print('color wheel drawn');
+}
+
+void mandelbrot() {
+  // Real Mandelbrot, computed in JS for speed but parameterized from Dart.
+  jsEval(r'''
+    const c = document.getElementById('sketch'), W = c.width, H = c.height;
+    const ctx = c.getContext('2d');
+    const img = ctx.createImageData(W, H);
+    const data = img.data;
+    const cx = a[0], cy = a[1], zoom = a[2], maxIter = a[3];
+    for (let py = 0; py < H; py++) {
+      for (let px = 0; px < W; px++) {
+        const x0 = cx + (px - W/2) * zoom / W;
+        const y0 = cy + (py - H/2) * zoom / H;
+        let x = 0, y = 0, i = 0;
+        for (; i < maxIter && x*x + y*y < 4; i++) {
+          const xn = x*x - y*y + x0;
+          y = 2*x*y + y0; x = xn;
+        }
+        const idx = (py * W + px) * 4;
+        if (i === maxIter) {
+          data[idx] = 0; data[idx+1] = 0; data[idx+2] = 0;
+        } else {
+          const t = i / maxIter;
+          data[idx]   = Math.round(255 * Math.pow(t, 0.4));
+          data[idx+1] = Math.round(255 * t * (1 - t) * 4);
+          data[idx+2] = Math.round(255 * (1 - t));
+        }
+        data[idx+3] = 255;
+      }
+    }
+    ctx.putImageData(img, 0, 0);
+  ''', [-0.5, 0.0, 3.0, 150]);
+  print('mandelbrot rendered');
+}
+
+void zoomedMandelbrot() {
+  // Same renderer, different params — deep into the seahorse valley.
+  jsEval(r'''
+    const c = document.getElementById('sketch'), W = c.width, H = c.height;
+    const ctx = c.getContext('2d');
+    const img = ctx.createImageData(W, H), data = img.data;
+    const cx = a[0], cy = a[1], zoom = a[2], maxIter = a[3];
+    for (let py = 0; py < H; py++) for (let px = 0; px < W; px++) {
+      const x0 = cx + (px - W/2) * zoom / W;
+      const y0 = cy + (py - H/2) * zoom / H;
+      let x = 0, y = 0, i = 0;
+      for (; i < maxIter && x*x + y*y < 4; i++) {
+        const xn = x*x - y*y + x0; y = 2*x*y + y0; x = xn;
+      }
+      const idx = (py * W + px) * 4;
+      const t = i === maxIter ? 0 : i / maxIter;
+      data[idx]   = Math.round(20 + 235 * t);
+      data[idx+1] = Math.round(10 + 200 * t * (1 - t) * 4);
+      data[idx+2] = Math.round(40 + 60 * Math.sin(t * 12));
+      data[idx+3] = 255;
+    }
+    ctx.putImageData(img, 0, 0);
+  ''', [-0.745, 0.105, 0.025, 350]);
+  print('zoomed-in mandelbrot');
+}
+
+void spirograph() {
+  // Hypotrochoid drawn with vector lines.
+  jsEval(r'''
+    const c = document.getElementById('sketch'), W = c.width, H = c.height;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#fafafa'; ctx.fillRect(0, 0, W, H);
+    const R = a[0], r = a[1], d = a[2], turns = a[3];
+    const cx = W/2, cy = H/2;
+    ctx.translate(cx, cy);
+    ctx.lineWidth = 1.0;
+    let firstPt = true;
+    for (let t = 0; t <= turns * Math.PI * 2; t += 0.01) {
+      const x = (R - r) * Math.cos(t) + d * Math.cos((R - r)/r * t);
+      const y = (R - r) * Math.sin(t) - d * Math.sin((R - r)/r * t);
+      if (firstPt) { ctx.beginPath(); ctx.moveTo(x, y); firstPt = false; }
+      else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = 'hsl(' + (a[4] | 0) + ', 70%, 45%)';
+    ctx.stroke();
+    ctx.resetTransform();
+  ''', [180, 65, 90, 12, DateTime.now().millisecondsSinceEpoch % 360]);
+  print('spirograph drawn (try Hot Reload with different R, r, d)');
+}
+
+void plotSineFromDart() {
+  // Compute the samples in Dart, ship as a single array to JS for plotting.
+  final n = 400;
+  final ys = List<double>.generate(
+    n, (i) => 0.5 + 0.4 * (i / n) * (0.5 + 0.5 *
+        (i.isEven ? 1 : -1) * (i % 7 == 0 ? -1 : 1) *
+        // a synthetic but interesting curve
+        ((i % 23) / 23)));
+  jsEval(r'''
+    const c = document.getElementById('sketch'), W = c.width, H = c.height;
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#0d1117'; ctx.fillRect(0, 0, W, H);
+    ctx.strokeStyle = '#00B4AB'; ctx.lineWidth = 2;
+    const ys = a[0];
+    ctx.beginPath();
+    for (let i = 0; i < ys.length; i++) {
+      const x = (i / (ys.length - 1)) * W;
+      const y = H - ys[i] * H;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+  ''', [ys]);
+  print('Dart-computed curve rendered (\${ys.length} samples)');
+}
+
+void startAnimation() {
+  // The animation loop runs in JS so we don't pay per-frame interop. Dart
+  // kicks it off with one eval; stopAnimation() clears the handle.
+  jsEval(r'''
+    if (window.__dartSketchAnim) clearInterval(window.__dartSketchAnim);
+    const c = document.getElementById('sketch'), W = c.width, H = c.height;
+    const ctx = c.getContext('2d');
+    let t = 0;
+    window.__dartSketchAnim = setInterval(function() {
+      ctx.fillStyle = 'rgba(13,17,23,0.06)';
+      ctx.fillRect(0, 0, W, H);
+      const cx = W/2, cy = H/2;
+      const n = 14;
+      for (let i = 0; i < n; i++) {
+        const ang = (i / n) * Math.PI * 2 + t;
+        const r = Math.min(W, H) * 0.4 * (0.6 + 0.4 * Math.sin(t * 1.3 + i));
+        const x = cx + r * Math.cos(ang);
+        const y = cy + r * Math.sin(ang);
+        ctx.beginPath();
+        ctx.arc(x, y, 12, 0, Math.PI * 2);
+        ctx.fillStyle = 'hsl(' + ((i / n * 360 + t * 60) % 360) + ', 80%, 60%)';
+        ctx.fill();
+      }
+      t += 0.04;
+    }, 16);
+  ''');
+  print('animation running (Invoke stopAnimation() to stop)');
+}
+
+void stopAnimation() {
+  jsEval(r'''
+    if (window.__dartSketchAnim) {
+      clearInterval(window.__dartSketchAnim);
+      window.__dartSketchAnim = null;
+    }
+  ''');
+  print('animation stopped');
+}
+
+void main() {
+  print('Canvas demo ready. Invoke any drawing function above.');
+  print('(If the Sketch pane is closed, click the Sketch button in the toolbar.)');
 }
 `,
   // The "headline" sample for this demo: persistent iterative computation
@@ -875,6 +1268,7 @@ async function doRun() {
     outInfo.textContent = `compile ${compileMs} ms · run ${runMs} ms`;
     status.innerHTML = `<span class="ok">done</span>`;
     hasRun = true;
+    window.__onProgramStateChange?.();
   });
 }
 
@@ -894,6 +1288,7 @@ async function doReload() {
       const resPtr = await reloadAsync(ptr, kernel.length, 0);
       out.textContent = VM.UTF8ToString(resPtr);
       status.innerHTML = '<span class="ok">reloaded</span> (state preserved)';
+      window.__onProgramStateChange?.();
     } catch (e) {
       // ReloadKernel can trap on out-of-bounds when the live program has
       // already-pending microtasks/timers that reference the old kernel
@@ -925,6 +1320,7 @@ async function doInvoke(nameArg) {
     VM._free(fPtr);
     outInfo.textContent = `invoke ${name}() in ${ms} ms`;
     status.innerHTML = '<span class="ok">invoked</span>';
+    window.__onProgramStateChange?.();
   });
 }
 // Wire CodeLens command to invoke handler.
@@ -1227,6 +1623,8 @@ $('sampleSelect').addEventListener('change', e => {
     editor.setValue(SAMPLES[v]);
     // suggest a sensible invoke target per sample
     if (v === 'counter') $('invokeName').value = 'increment';
+    // Auto-open the relevant side pane.
+    if (v === 'canvas' && !sketchOpen) setSketchOpen(true);
   }
 });
 $('ilDialogClose').addEventListener('click', () => $('ilDialog').style.display = 'none');
@@ -1257,6 +1655,14 @@ function renderInstance(instance, depth = 0) {
   const wrap = document.createElement('span');
   if (!instance || instance.kind === undefined) {
     wrap.innerHTML = '<span class="insp-null">(no value)</span>';
+    return wrap;
+  }
+  // Sentinel objects (NotInitialized, BeingInitialized, OptimizedOut, ...)
+  // come back with type:"Sentinel" instead of "@Instance". Display them
+  // distinctly so it's obvious the lazy initializer hasn't fired.
+  if (instance.type === 'Sentinel') {
+    wrap.innerHTML = '<span class="insp-null">⟨' +
+      escHtml(instance.kind || 'sentinel') + '⟩</span>';
     return wrap;
   }
   const k = instance.kind;
@@ -1411,14 +1817,32 @@ function setInspectorOpen(open) {
 $('inspectorBtn').addEventListener('click', () => setInspectorOpen(!inspectorOpen));
 $('inspectorRefresh').addEventListener('click', refreshInspector);
 
-// Auto-refresh when the program state changes.
-const origDoRun = doRun;
-doRun = async function() { await origDoRun.apply(this, arguments); if (inspectorOpen) refreshInspector(); };
-const origDoReload = doReload;
-doReload = async function() { await origDoReload.apply(this, arguments); if (inspectorOpen) refreshInspector(); };
-const origDoInvoke = doInvoke;
-doInvoke = async function() { await origDoInvoke.apply(this, arguments); if (inspectorOpen) refreshInspector(); };
-invokeFn = (name) => doInvoke(name);  // re-bind since doInvoke was replaced
+// Sketch pane: a togglable canvas-host that user code can draw into via
+// jsEval('document.getElementById("sketch")...').
+let sketchOpen = false;
+function setSketchOpen(open) {
+  sketchOpen = open;
+  $('sketchPane').style.display = open ? '' : 'none';
+  document.querySelector('.layout').classList.toggle('with-sketch', open);
+  $('sketchBtn').style.background = open ? 'var(--dart-blue)' : '';
+  $('sketchBtn').style.color = open ? 'white' : '';
+}
+$('sketchBtn').addEventListener('click', () => setSketchOpen(!sketchOpen));
+$('sketchClear').addEventListener('click', () => {
+  const c = $('sketch');
+  c.getContext('2d').clearRect(0, 0, c.width, c.height);
+  // Also stop any user-started animation loop.
+  if (window.__dartSketchAnim) {
+    clearInterval(window.__dartSketchAnim);
+    window.__dartSketchAnim = null;
+  }
+});
+
+// Auto-refresh after Run / Reload / Invoke. We can't wrap the existing
+// doRun/doReload/doInvoke here — the button listeners already captured the
+// originals — so we publish a "program state changed" hook that those
+// functions opt into below.
+window.__onProgramStateChange = () => { if (inspectorOpen) refreshInspector(); };
 </script>
 
 </body>
