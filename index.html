@@ -1114,6 +1114,21 @@ status.innerHTML = '<span class="info">loading platform…</span>';
 const platformBytes = new Uint8Array(
   await (await fetch('vm_platform.dill?v=' + Date.now(), { cache: 'no-store' })).arrayBuffer());
 
+// Load optional pre-compiled package dills.
+// Embedders declare packages before this script runs:
+//   window.dartLivePackages = [{ name: 'knex_dart', dillUrl: './knex_dart.dill' }]
+// Each dillUrl should point to a kernel file produced by:
+//   dart compile kernel --platform=vm_platform.dill -o knex_dart.dill lib/knex_dart.dart
+const packageDills = [];
+const pkgConfigs = globalThis.dartLivePackages ?? [];
+if (pkgConfigs.length > 0) {
+  status.innerHTML = '<span class="info">loading packages…</span>';
+  const bufs = await Promise.all(
+    pkgConfigs.map(p => fetch(p.dillUrl).then(r => r.arrayBuffer()))
+  );
+  packageDills.push(...bufs.map(b => new Uint8Array(b)));
+}
+
 // Analyzer (separate dart2wasm module). Failure is non-fatal — Run/Reload
 // don't depend on it.
 status.innerHTML = '<span class="info">loading analyzer…</span>';
@@ -1126,7 +1141,10 @@ status.innerHTML = '<span class="info">loading analyzer…</span>';
     ]);
     const inst = await (await m.compileStreaming(analyzerWasm)).instantiate({});
     inst.invokeMain([]);
-    globalThis.dartAnalyzerInit(new Uint8Array(sdkBuf));
+    // packageDills: List<Uint8List> of pre-compiled package kernel files.
+    // dartAnalyzerInit needs to accept this as a second argument so the
+    // analyzer resolves `package:` imports against the supplied dills.
+    globalThis.dartAnalyzerInit(new Uint8Array(sdkBuf), packageDills);
     runAnalysis();
   } catch (e) {
     $('diagCounts').innerHTML = '<span class="err">analyzer failed: ' +
@@ -1225,7 +1243,9 @@ const extractSync = VM.cwrap('dart_il_extract', 'number', ['number', 'number', '
 
 async function compile(source) {
   const t0 = performance.now();
-  const k = new Uint8Array(await globalThis.dartCompile(source, platformBytes));
+  // packageDills: List<Uint8List> — dartCompile needs a third argument so the
+  // CFE resolves `package:` imports against the supplied pre-compiled dills.
+  const k = new Uint8Array(await globalThis.dartCompile(source, platformBytes, packageDills));
   for (let i = 8; i < 18; i++) k[i] = 0x30;
   return { kernel: k, ms: (performance.now() - t0).toFixed(0) };
 }
