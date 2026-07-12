@@ -314,6 +314,8 @@ https://playground.knex.mahawarkartikey.in embeds dart-live with the
 `import 'package:knex_dart/knex_dart.dart';` and have it resolve,
 compile, run, and type-check in the browser.
 
+Also: https://github.com/code-shoily/kino_yogex_playground
+
 ## License
 
 This repository contains a built artifact bundle. Build inputs and patches
